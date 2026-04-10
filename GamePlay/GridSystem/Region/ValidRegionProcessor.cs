@@ -59,13 +59,13 @@ namespace TenMaker.Gameplay
             if (IsValidRegion(region) is false) return false;
 
             if (region.minRow < region.maxRow &&
-                IsValidRegion(region.ShrinkFromBottom) || IsValidRegion(region.ShrinkFromTop))
+                (IsValidRegion(region.ShrinkFromBottom) || IsValidRegion(region.ShrinkFromTop)))
             {
                 return false;
             }
 
             if (region.minCol < region.maxCol &&
-                IsValidRegion(region.ShrinkFromLeft) || IsValidRegion(region.ShrinkFromRight))
+                (IsValidRegion(region.ShrinkFromLeft) || IsValidRegion(region.ShrinkFromRight)))
             {
                 return false;
             }
