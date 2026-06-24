@@ -1,37 +1,47 @@
 # TenMaker
-> 써드파티 에셋 라이센스로 인해 전체 프로젝트가 아닌 C# 스크립트만 포함
+> 써드파티 에셋 라이선스로 인해 전체 프로젝트가 아닌 C# 스크립트만 포함
 
-> 사과게임 류 (합이 10인 영역 제거) | Unity | 1인 개발 | PC · 모바일 | 미출시
+> 퍼즐 (사과게임 류) | Unity, C# | 1인 개발 | PC · Android | 미출시 (싱글 · 멀티 타임어택 모드 구현)
+> 개발 기간 2024.05 – 2024.09
+
+<img src="https://github.com/user-attachments/assets/aab9ebcb-43c4-4e0d-9b74-955c5aedcf6b" width="440" />
+
+### 멀티플레이 영상
+🔗 [멀티플레이 영상 보기](MULTIPLAY_VIDEO_URL)
 
 ---
 
 ## 기술 스택
 
 - **Unity, C#**
-- **Netcode for GameObjects** — 서버 권위 멀티플레이
-- **Unity Gaming Services (UGS)** — Relay(NAT 우회 연결), 게스트 로그인, 랭킹
-- **Unity Mediation** — 광고 미디에이션
+- **Netcode for GameObjects (NGO)** — 서버 권위 멀티플레이 (입력을 서버에서 검증·동기화)
+- **Unity Relay** — 호스트·클라이언트 연결 중계 (NAT 우회)
+- **Unity Gaming Services (UGS)** — Authentication(게스트 로그인), Leaderboards(랭킹)
 
 ---
 
-## 핵심 구현
+## 게임 규칙
+
+보드 위 1~9 숫자 타일에서 **합이 10이 되는 사각 영역**을 선택해 제거하고, 그 영역을 자신의 땅으로 차지합니다. 최종적으로 확보한 타일 수로 점수를 겨룹니다.
+
+---
+
+## 핵심 1 — 서버 권위 멀티플레이 (NGO + Relay)
 
 | 파일 | 역할 |
 |------|------|
-| [RegionSelectionHandler.cs](GamePlay/RegionClear/RegionSelectionHandler.cs) | 서버 검증 + 결과 브로드캐스트 (Rpc) |
-| [PlayerInputController.cs](GamePlay/Player/Multiplay/PlayerInputController.cs) | Owner 전용 드래그 입력 → 서버 요청 |
-| [GridController.cs](GamePlay/GridSystem/Grid/Multiplay/GridController.cs) | 그리드 네트워크 동기화 |
-| [ValidRegionChecker.cs](GamePlay/GridSystem/Region/ValidRegionChecker.cs) | 2D Prefix Sum 검증 + 최소 유효 영역 트림 |
-| [RegionSumCalculator.cs](GamePlay/GridSystem/Region/RegionSumCalculator.cs) | 2D Prefix Sum 계산 (영역 합 O(1)) |
-| [MultiplayManager.cs](Services/UGS/Multiplay/MultiplayManager.cs) | UGS Relay 연결 관리 |
-| [TMAudioManager.cs](Core/Audio/TMAudioManager.cs) | 서비스 로케이터 (구현체/인터페이스/접근자 분리) |
+| [PlayerInputController.cs](GamePlay/Player/Multiplay/PlayerInputController.cs) | Owner 전용 드래그 입력 → 서버에 ServerRpc로 *요청* |
+| [GridController.cs](GamePlay/GridSystem/Grid/Multiplay/GridController.cs) | 서버 그리드에서 검증·Trim·반영 + Server/Local Grid 분리 |
+| [RegionSelectionHandler.cs](GamePlay/RegionClear/RegionSelectionHandler.cs) | 서버 판정 오케스트레이션 + 결과 ClientRpc 브로드캐스트 |
 
-### Netcode for GameObjects 기반 서버 권위 멀티플레이
+**동기** — 멀티플레이를 단순 구현에 그치지 않고, **실제 라이브 서비스에서 쓰일 법한 치팅에 안전한 구조**로 만드는 것을 목표로 잡았습니다.
 
-Photon·Fishnet 등 외부 솔루션과 비교한 끝에, **"누가 무엇을 결정할 권한을 갖는가"** 를 명확히 하기 위해 서버 권위 구조를 선택했습니다. 클라이언트는 드래그 영역을 *요청*만 하고, 합이 10인지에 대한 최종 판정과 셀 제거는 서버가 수행합니다.
+**기술 선택** — Photon·Mirror 같은 외부 솔루션 대신, Unity가 멀티플레이를 자체 생태계(UGS)로 통합해 가는 흐름이라 장기 학습 가치가 크다고 보고 **NGO + Relay**를 택했습니다. 치팅에 취약한 클라이언트 권위 대신, **서버가 검증한 결과만 동기화하는 서버 권위 구조**로 설계했습니다.
+
+**구현** — 흐름을 `입력 → 검증 → 동기화` 한 방향으로 단순화했습니다. 클라이언트는 입력과 연출만 담당하고, 게임 규칙은 서버가 단일 진실 공급원(SSOT)으로 통제합니다.
 
 ```csharp
-// PlayerInputController.cs — 드래그 종료 시 로컬 반영 + 서버로 요청 (Owner 전용)
+// PlayerInputController.cs — 드래그 종료 시: 로컬 반영 후 서버로 '요청'만 (Owner 전용)
 private void HandleCellDragCanceled(GridSelectionData data)
 {
     var selectedRegion = data.ToRegion();
@@ -48,29 +58,47 @@ private void FinishDragServerRpc(Region selectedRegion, RpcParams rpcParams = de
 ```
 
 ```csharp
-// RegionSelectionHandler.cs — 검증·점수는 서버에서, 결과만 전 클라이언트로 브로드캐스트
-public void FinishSelectionServer(ulong clientId, Region selectedRegion)
+// GridController.cs — 서버 그리드에서만 [검증 → Trim → 반영], 무효 선택은 null로 차단
+public RegionClearResult? ClearRegionServer(ulong clearedClientId, Region region)
 {
-    var regionClearResult = gridController.ClearRegionServer(clientId, selectedRegion); // 서버 검증 + 제거
-    if (regionClearResult == null) return; // 무효한 선택 → 무시 (치팅 방지)
+    if (ValidRegionChecker.IsValidRegion(region) is false) return null;          // 합=10 검증 (치팅 차단)
 
-    comboController.IncreaseComboServer(clientId);
-    scoreSystem.UpdateScoreServer();
+    region = ValidRegionChecker.TrimMinimalValidRegion(region);                  // 최소 유효 영역 정규화
+    var clearedCellCoordinates = ServerGrid.ClearRegion(clearedClientId, region);
+    if (clearedCellCoordinates.Count == 0) return null;
 
-    var clearEvent = new ClearEventDTO(
-        clientId, regionClearResult.Value, comboController.GetCombo(clientId), scoreSystem.GetScoreDTO());
-    HandleRegionClearedClientRpc(clearEvent); // 전 클라이언트 동기화
+    ValidRegionChecker.Compute();                                               // Prefix Sum 갱신
+    return new RegionClearResult(region, clearedCellCoordinates);
 }
 ```
 
-판정을 서버에 집중시켜 클라이언트가 조작된 영역을 보내도 검증에서 걸러집니다. `GridController`는 실제로 **`ServerGrid`(+ `ValidRegionChecker`)와 `LocalGrid`를 분리**해 보유하며, 검증은 서버 그리드에서만 수행합니다. 추후 DGS(전용 서버)로 전환할 때 서버 검증 코드를 그대로 이전할 수 있도록 한 설계입니다.
+이 흐름을 직접 설계하며, 멀티플레이는 단순한 패킷 교환이 아니라 **누가 결정 권한을 갖는가**의 문제임을 체감했습니다.
 
-### 2D Prefix Sum 기반 영역 합 계산
+**한계와 대비** — 현 구조에는 넷코드의 근본적 한계 두 가지가 있습니다. 둘 다 개선 방향을 확인했고, 그중 **호스트 치팅 문제는 구조적으로 미리 대비**해 두었습니다.
 
-서버는 매 선택마다 영역 합을 검증해야 합니다. 매번 영역 내 셀을 전부 순회하면 영역 크기에 비례한 비용이 들지만, 2D Prefix Sum 테이블을 한 번 구축해두면 **임의 영역의 합을 O(1)로** 구할 수 있습니다.
+| 한계 | 직면한 문제 | 개선 방향 |
+|------|------------|----------|
+| **입력 반응 지연** (RPC 왕복) | 입력이 서버 검증을 거친 뒤 반영되어 네트워크 지연만큼 반응이 느려짐 | 클라이언트 예측(Client-side Prediction)으로 완화 가능함을 *확인* |
+| **호스트 치팅** (Host-Client) | 호스트가 서버를 겸해 본인 치팅을 원천 차단 불가 | 서버 판정용 **Server Grid**와 표시용 **Local Grid**를 처음부터 분리 → 로직 유지한 채 Dedicated Server 전환 가능하도록 *대비* |
+
+---
+
+## 핵심 2 — 2D Prefix Sum 기반 영역 합 최적화
+
+| 파일 | 역할 |
+|------|------|
+| [GridGenerator.cs](GamePlay/GridSystem/Grid/Common/GridGenerator.cs) | 시작 보드 생성 + 최소 정답 수 검증 (Prefix Sum) |
+| [ValidRegionChecker.cs](GamePlay/GridSystem/Region/ValidRegionChecker.cs) | 런타임 영역 합 O(1) 검증 + 최소 유효 영역 Trim |
+| [Region.cs](GamePlay/GridSystem/Region/Region.cs) | `ShrinkFrom*` 4방향 축소 프리미티브 |
+
+**동기** — 임의의 사각 영역 합을 반복해서 구해야 하는 핵심 연산이 두 곳 있었습니다.
+- **시작 보드 검증** — 무작위 보드에 풀 수 있는 정답(합이 10인 최소 영역)이 기준치(`30`개) 이상인지 확인, 부족하면 재생성
+- **런타임 영역 정규화(Trim)** — 빈 칸을 포함해 넓게 드래그해도 점수 규칙에 맞춰 '최소 유효 영역'으로 보정
+
+**해결** — 단순 4중 반복은 영역 후보 `O(r²c²)`개마다 `O(rc)` 합산이 들어 총 `O(r³c³)`까지 커집니다. 격자를 `O(rc)`로 한 번 전처리해두면 임의 영역 합을 `O(1)`로 조회하는 **2D Prefix Sum(누적합)** 을 도입해, 시작 검증을 `O(r²c²)`로 한 차수 낮췄습니다. (현 보드 17×10은 작지만 확장 대비.) 댕댕이 서바이벌에서 단순 연산의 한계를 Flow Field로 돌파했던 경험을 떠올려 적용했습니다.
 
 ```csharp
-// ValidRegionChecker.cs — Prefix Sum 테이블 구축 (그리드 변경 시 호출)
+// ValidRegionChecker.cs — Prefix Sum 전처리 (그리드 변경 시 호출). 이후 임의 영역 합을 O(1)로 조회
 public void Compute()
 {
     for (var row = 0; row < _grid.RowCount; row++)
@@ -83,22 +111,17 @@ public void Compute()
         }
 }
 
-// 임의 영역의 합을 O(1)로 계산
-public int GetRegionSum(Region region)
-{
-    return _prefixSumGrid[region.maxRow + 1, region.maxCol + 1]
-         - _prefixSumGrid[region.minRow, region.maxCol + 1]
-         - _prefixSumGrid[region.maxRow + 1, region.minCol]
-         + _prefixSumGrid[region.minRow, region.minCol];
-}
+public int GetRegionSum(Region region) =>
+      _prefixSumGrid[region.maxRow + 1, region.maxCol + 1] - _prefixSumGrid[region.minRow, region.maxCol + 1]
+    - _prefixSumGrid[region.maxRow + 1, region.minCol]     + _prefixSumGrid[region.minRow, region.minCol];
 
 public bool IsValidRegion(Region region) => GetRegionSum(region) == GameRule.TARGET_SUM;
 ```
 
-여기에 더해, 검증된 영역을 네 변에서 한 줄씩 줄여가며 **최소 유효 영역으로 트림**합니다. 동일한 선택이라도 정규화된 영역으로 다루어, 이후 처리의 일관성과 표현력을 함께 끌어올렸습니다.
+**구현 — 런타임 Trim** — 검증된 영역을 합이 유지되는 한 네 변에서 한 줄씩 줄여 '최소 유효 영역'으로 정규화합니다. `Region`의 `ShrinkFrom*` 프로퍼티로 축소 의도가 코드에 그대로 드러납니다.
 
 ```csharp
-// ValidRegionChecker.cs — 합이 유지되는 한 네 변에서 영역 축소
+// ValidRegionChecker.cs — 합이 유지되는 한 네 변에서 한 줄씩 축소 → 최소 유효 영역
 public Region TrimMinimalValidRegion(Region region)
 {
     while (region.CanShrinkRow && IsValidRegion(region.ShrinkFromBottom)) region = region.ShrinkFromBottom;
@@ -109,62 +132,62 @@ public Region TrimMinimalValidRegion(Region region)
 }
 ```
 
-### 서비스 로케이터 패턴
+**결론** — 한 번의 전처리로 시작 검증과 런타임 Trim 두 곳을 동시에 최적화했고, `ShrinkFrom*` 4방향 축소 프로퍼티로 Trim 로직의 가독성까지 끌어올렸습니다.
 
-전역에서 필요한 매니저는 **구현체 / 인터페이스 / static 접근자** 세 부분으로 분리했습니다. 예를 들어 오디오는 `AudioManager`(구현체) · `IAudioManager`(인터페이스) · `TMAudioManager`(static 접근자)로 나뉩니다. 호출부는 `TMAudioManager.Instance.PlaySfx(...)` 처럼 인터페이스로만 접근해, 구현체 교체나 테스트 대역 주입이 자유롭습니다.
+---
+
+## 서비스 로케이터 — 전역 매니저 접근 (적용 예시)
+
+| 파일 | 역할 |
+|------|------|
+| [TMAudioManager.cs](Core/Audio/TMAudioManager.cs) | 인터페이스만 노출하는 static 접근자 |
+
+전역에서 필요한 매니저는 **구현체 / 인터페이스 / static 접근자** 세 부분으로 분리했습니다. 오디오는 `AudioManager`(구현체) · `IAudioManager`(인터페이스) · `TMAudioManager`(static 접근자)로 나뉘고, 호출부는 인터페이스로만 접근해 구현체 교체·테스트 대역 주입이 자유롭습니다.
 
 ```csharp
-// TMAudioManager.cs — 인터페이스만 노출하는 static 접근자
+// TMAudioManager.cs — 인터페이스만 노출하는 static 접근자 (부팅 시 구현체 1회 등록)
 public static class TMAudioManager
 {
     public static IAudioManager Instance { get; private set; }
 
-    public static void Initialize(IAudioManager manager) // 부팅 시 구현체 등록
+    public static void Initialize(IAudioManager manager)
     {
-        if (Instance != null) { TBMLog.HeaderError("already initialized"); return; }
+        if (Instance != null) { TBMLog.HeaderError($"{typeof(TMAudioManager)} is already initialized."); return; }
         Instance = manager;
     }
-
-    public static void Deinitialize(IAudioManager manager)
-    {
-        if (manager != Instance) return;
-        Instance = null;
-    }
+    // ...
 }
 ```
 
-전 시스템에 이벤트 채널을 깔았던 이전 프로젝트(마왕 수박 v1)의 경험을 거쳐, 이번에는 전역 접근이 꼭 필요한 *매니저 객체에 한정*해 이 구조를 적용했습니다.
+```csharp
+// 호출부 — 구현체를 모른 채 인터페이스로만 사용 (SettingsUI.cs)
+TMAudioManager.Instance.SetBgmVolume(value);
+```
+
+전 시스템에 이벤트 채널을 깔았던 이전 프로젝트(마왕 수박)의 경험을 거쳐, 이번에는 전역 접근이 꼭 필요한 *매니저 객체에 한정*해 이 구조를 적용했습니다.
 
 ---
 
 ## 핵심 코드 구조
-
-```
+<pre>
 08_TenMaker/
 ├── GamePlay/
-│   ├── GridSystem/
-│   │   ├── Grid/Multiplay/        # 책임 분리된 그리드 ★
-│   │   │   └── GridController.cs  # 네트워크 동기화
-│   │   └── Region/                # 영역 검증 ★
-│   │       ├── RegionSumCalculator.cs   # 2D Prefix Sum
-│   │       └── ValidRegionChecker.cs    # 검증 + Trim
 │   ├── Player/Multiplay/
-│   │   ├── PlayerInputController.cs     # Owner 전용 입력 → 서버 요청
-│   │   ├── PlayerController.cs
-│   │   └── PlayerNetworkSpawner.cs
-│   └── RegionClear/
-│       └── RegionSelectionHandler.cs    # 서버 검증 + 동기화 ★
-├── Services/UGS/
-│   ├── Multiplay/                       # Relay 연결
-│   │   ├── MultiplayManager.cs
-│   │   └── TMMultiplayService.cs
-│   ├── Authentication/AuthenticationManager.cs # 게스트 로그인
-│   └── Leaderboards/LeaderboardsManager.cs     # 랭킹
-├── Core/
-│   ├── Audio/                     # 서비스 로케이터 예시 ★
-│   │   ├── AudioManager.cs        # 구현체
-│   │   ├── IAudioManager.cs       # 인터페이스
-│   │   └── TMAudioManager.cs      # static 접근자
-│   └── Region/                    # 싱글플레이 레거시 (Before 비교용)
-└── ...
-```
+│   │   └── <a href="GamePlay/Player/Multiplay/PlayerInputController.cs">PlayerInputController.cs</a>   # Owner 입력 → ServerRpc 요청
+│   ├── RegionClear/
+│   │   └── <a href="GamePlay/RegionClear/RegionSelectionHandler.cs">RegionSelectionHandler.cs</a>  # 서버 판정 + ClientRpc 브로드캐스트
+│   └── GridSystem/
+│       ├── Grid/Multiplay/<a href="GamePlay/GridSystem/Grid/Multiplay/GridController.cs">GridController.cs</a>   # Server/Local Grid 분리·검증·동기화 ★
+│       ├── Grid/Common/<a href="GamePlay/GridSystem/Grid/Common/GridGenerator.cs">GridGenerator.cs</a>      # 보드 생성 + Prefix Sum 검증
+│       └── Region/
+│           ├── <a href="GamePlay/GridSystem/Region/ValidRegionChecker.cs">ValidRegionChecker.cs</a>           # Prefix Sum 검증 + Trim ★
+│           └── <a href="GamePlay/GridSystem/Region/Region.cs">Region.cs</a>                       # ShrinkFrom* 4방향 축소
+├── Core/Audio/                         # 서비스 로케이터 적용 예시
+│   ├── <a href="Core/Audio/AudioManager.cs">AudioManager.cs</a>                  # 구현체
+│   ├── <a href="Core/Audio/IAudioManager.cs">IAudioManager.cs</a>                 # 인터페이스
+│   └── <a href="Core/Audio/TMAudioManager.cs">TMAudioManager.cs</a>                # static 접근자
+└── Services/UGS/
+    ├── Multiplay/<a href="Services/UGS/Multiplay/MultiplayManager.cs">MultiplayManager.cs</a>           # Relay 연결 중계
+    ├── Authentication/<a href="Services/UGS/Authentication/AuthenticationManager.cs">AuthenticationManager.cs</a>  # 게스트 로그인
+    └── Leaderboards/<a href="Services/UGS/Leaderboards/LeaderboardsManager.cs">LeaderboardsManager.cs</a>       # 랭킹
+</pre>
