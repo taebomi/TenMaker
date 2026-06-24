@@ -7,7 +7,7 @@
 <img src="https://github.com/user-attachments/assets/aab9ebcb-43c4-4e0d-9b74-955c5aedcf6b" width="440" />
 
 ### 멀티플레이 영상
-🔗 [멀티플레이 영상 보기](MULTIPLAY_VIDEO_URL)
+🔗 [멀티플레이 영상 보기](https://youtu.be/l_5srmBzxZI)
 
 ---
 
