@@ -16,6 +16,7 @@
 - **Netcode for GameObjects (NGO)** — 서버 권위 멀티플레이 (입력을 서버에서 검증·동기화)
 - **Unity Relay** — 호스트·클라이언트 연결 중계 (NAT 우회)
 - **Unity Gaming Services (UGS)** — Authentication(게스트 로그인), Leaderboards(랭킹)
+- **UniTask** — UGS 비동기 연동, 취소 토큰 전파·수명 관리
 
 ---
 
@@ -135,6 +136,27 @@ public Region TrimMinimalValidRegion(Region region)
 
 ---
 
+## 핵심 3 — UGS 비동기 연동 · 취소/예외 처리
+
+| 파일 | 역할 |
+|------|------|
+| [AuthenticationManager.cs](Services/UGS/Authentication/AuthenticationManager.cs) | 게스트 로그인 async, 취소·예외 구분 처리 |
+| [LeaderboardsManager.cs](Services/UGS/Leaderboards/LeaderboardsManager.cs) | 랭킹 조회, `UniTask.WhenAll`로 동시 요청 |
+
+**설계** — UGS 네트워크 작업을 `UniTask<Result<T>>`로 감싸 예외를 throw 대신 값으로 반환하고, `CancellationToken`을 전 계층에 전파했습니다. 취소(`OperationCanceledException`)는 도메인 예외와 구분해 처리합니다.
+
+```csharp
+// AuthenticationManager.cs — 취소를 도메인 예외와 구분, 결과는 Result로 반환
+try
+{
+    await Service.SignInAnonymouslyAsync().AsUniTask().AttachExternalCancellation(ct);
+}
+catch (AuthenticationException ex) { return Result<SignInPayload>.Fail(ex.ErrorCode, new SignInPayload(ex.Notifications)); }
+catch (OperationCanceledException) { return Result<SignInPayload>.Fail(TMAuthenticationErrorCode.USER_CANCELLED, new SignInPayload()); }
+```
+
+---
+
 ## 서비스 로케이터 — 전역 매니저 접근 (적용 예시)
 
 | 파일 | 역할 |
@@ -187,6 +209,6 @@ TMAudioManager.Instance.SetBgmVolume(value);
 │   └── <a href="Core/Audio/TMAudioManager.cs">TMAudioManager.cs</a>                # static 접근자
 └── Services/UGS/
     ├── Multiplay/<a href="Services/UGS/Multiplay/MultiplayManager.cs">MultiplayManager.cs</a>           # Relay 연결 중계
-    ├── Authentication/<a href="Services/UGS/Authentication/AuthenticationManager.cs">AuthenticationManager.cs</a>  # 게스트 로그인
-    └── Leaderboards/<a href="Services/UGS/Leaderboards/LeaderboardsManager.cs">LeaderboardsManager.cs</a>       # 랭킹
+    ├── Authentication/<a href="Services/UGS/Authentication/AuthenticationManager.cs">AuthenticationManager.cs</a>  # 게스트 로그인 — async·취소/예외 구분
+    └── Leaderboards/<a href="Services/UGS/Leaderboards/LeaderboardsManager.cs">LeaderboardsManager.cs</a>       # 랭킹 — UniTask.WhenAll 동시 조회
 </pre>
